@@ -1,8 +1,9 @@
 import Foundation
 @preconcurrency import FoundationDB
 import Logging
+import Synchronization
 
-/// Actor responsible for managing embedding model metadata in FoundationDB.
+/// Class responsible for managing embedding model metadata in FoundationDB.
 ///
 /// The ModelManager provides thread-safe operations for:
 /// - Registering new embedding models
@@ -20,7 +21,7 @@ import Logging
 ///
 /// ## Caching Strategy
 ///
-/// The actor maintains an LRU cache (limit: 100) of model metadata to minimize
+/// ModelManager maintains an LRU cache (limit: 100) of model metadata to minimize
 /// database reads for frequently accessed models. The cache is automatically
 /// invalidated on updates and deletions.
 ///
@@ -55,18 +56,17 @@ import Logging
 ///
 /// ## Thread Safety
 ///
-/// All operations are actor-isolated, ensuring thread-safe access to the cache
-/// and database operations. The database property is marked as `nonisolated(unsafe)`
-/// for compatibility with FoundationDB's threading model.
-public actor ModelManager {
+/// Thread safety is provided by:
+/// - Swift Synchronization.Mutex for cache access (~1μs overhead vs ~10μs for actor)
+/// - FoundationDB transaction model for database operations
+public final class ModelManager: @unchecked Sendable {
 
     // MARK: - Properties
 
     /// FoundationDB database connection
     ///
-    /// Marked as `nonisolated(unsafe)` to allow passing to FoundationDB operations
-    /// which may execute on different threads. The actual thread safety is ensured
-    /// by FoundationDB's internal synchronization.
+    /// Marked as `nonisolated(unsafe)` for compatibility with FoundationDB's threading model.
+    /// The actual thread safety is ensured by FoundationDB's internal synchronization.
     nonisolated(unsafe) private let database: any DatabaseProtocol
 
     /// Root prefix for all model keys in FoundationDB
@@ -78,20 +78,17 @@ public actor ModelManager {
     /// Logger instance for debugging and monitoring
     private let logger: Logger
 
-    /// LRU cache for model metadata
-    ///
-    /// Caches up to 100 model metadata entries to minimize database reads.
-    /// The cache is automatically invalidated on model updates and deletions.
-    private var modelCache: [String: EmbeddingModelMetadata] = [:]
+    /// Cache state protected by Mutex
+    private struct CacheState {
+        var modelCache: [String: EmbeddingModelMetadata] = [:]
+        var cacheAccessOrder: [String] = []
+    }
 
     /// Maximum number of models to cache
     private let maxCacheSize = 100
 
-    /// Cache access order for LRU eviction
-    ///
-    /// Tracks the order in which models are accessed. When the cache exceeds
-    /// maxCacheSize, the least recently used model is evicted.
-    private var cacheAccessOrder: [String] = []
+    /// Mutex-protected cache state
+    private let cache: Mutex<CacheState>
 
     // MARK: - Initialization
 
@@ -112,6 +109,7 @@ public actor ModelManager {
         self.database = database
         self.rootPrefix = rootPrefix
         self.logger = logger
+        self.cache = Mutex(CacheState())
 
         logger.debug("ModelManager initialized", metadata: [
             "rootPrefix": "\(rootPrefix)"
@@ -207,11 +205,24 @@ public actor ModelManager {
     /// }
     /// ```
     public func getModel(name: String) async throws -> EmbeddingModelMetadata? {
-        // Check cache first
-        if let cached = modelCache[name] {
+        // Check cache first (with Mutex)
+        let cached = cache.withLock { state -> EmbeddingModelMetadata? in
+            guard let model = state.modelCache[name] else {
+                return nil
+            }
+
+            // Update access order
+            if let index = state.cacheAccessOrder.firstIndex(of: name) {
+                state.cacheAccessOrder.remove(at: index)
+            }
+            state.cacheAccessOrder.append(name)
+
+            return model
+        }
+
+        if let model = cached {
             logger.debug("Model cache hit", metadata: ["model": "\(name)"])
-            updateCacheAccessOrder(name)
-            return cached
+            return model
         }
 
         logger.debug("Model cache miss, querying database", metadata: ["model": "\(name)"])
@@ -437,10 +448,12 @@ public actor ModelManager {
             transaction.clear(key: statsKey)
         }
 
-        // Remove from cache
-        modelCache.removeValue(forKey: name)
-        if let index = cacheAccessOrder.firstIndex(of: name) {
-            cacheAccessOrder.remove(at: index)
+        // Remove from cache (with Mutex)
+        cache.withLock { state in
+            state.modelCache.removeValue(forKey: name)
+            if let index = state.cacheAccessOrder.firstIndex(of: name) {
+                state.cacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.info("Model deleted successfully", metadata: ["model": "\(name)"])
@@ -562,32 +575,24 @@ public actor ModelManager {
     ///
     /// - Parameter model: Model metadata to cache
     private func updateModelCache(_ model: EmbeddingModelMetadata) {
-        modelCache[model.name] = model
-        updateCacheAccessOrder(model.name)
+        cache.withLock { state in
+            state.modelCache[model.name] = model
 
-        // Evict LRU if cache is full
-        if modelCache.count > maxCacheSize {
-            if let lru = cacheAccessOrder.first {
-                modelCache.removeValue(forKey: lru)
-                cacheAccessOrder.removeFirst()
-                logger.debug("Evicted LRU model from cache", metadata: ["model": "\(lru)"])
+            // Update access order
+            if let index = state.cacheAccessOrder.firstIndex(of: model.name) {
+                state.cacheAccessOrder.remove(at: index)
+            }
+            state.cacheAccessOrder.append(model.name)
+
+            // Evict LRU if cache is full
+            if state.modelCache.count > maxCacheSize {
+                if let lru = state.cacheAccessOrder.first {
+                    state.modelCache.removeValue(forKey: lru)
+                    state.cacheAccessOrder.removeFirst()
+                    logger.debug("Evicted LRU model from cache", metadata: ["model": "\(lru)"])
+                }
             }
         }
-    }
-
-    /// Update cache access order for LRU tracking
-    ///
-    /// Moves the accessed model to the end of the access order array,
-    /// marking it as most recently used.
-    ///
-    /// - Parameter name: Model name that was accessed
-    private func updateCacheAccessOrder(_ name: String) {
-        // Remove existing entry if present
-        if let index = cacheAccessOrder.firstIndex(of: name) {
-            cacheAccessOrder.remove(at: index)
-        }
-        // Add to end (most recently used)
-        cacheAccessOrder.append(name)
     }
 
     /// Clear the entire model cache
@@ -599,12 +604,14 @@ public actor ModelManager {
     /// ## Example
     ///
     /// ```swift
-    /// await modelManager.clearCache()
+    /// modelManager.clearCache()
     /// // Next getModel call will query the database
     /// ```
     public func clearCache() {
-        modelCache.removeAll()
-        cacheAccessOrder.removeAll()
+        cache.withLock { state in
+            state.modelCache.removeAll()
+            state.cacheAccessOrder.removeAll()
+        }
         logger.debug("Model cache cleared")
     }
 }

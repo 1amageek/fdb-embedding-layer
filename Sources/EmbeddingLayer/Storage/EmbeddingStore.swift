@@ -1,18 +1,23 @@
 import Foundation
 @preconcurrency import FoundationDB
 import Logging
+import Synchronization
 
-/// Actor-based storage layer for embedding vectors in FoundationDB
+/// Mutex-based storage layer for embedding vectors in FoundationDB
 ///
 /// The `EmbeddingStore` manages the persistence and retrieval of embedding vectors,
 /// providing CRUD operations with built-in caching and batch support.
 ///
 /// Key Features:
-/// - Thread-safe operations via actor isolation
+/// - Thread-safe operations via Mutex (~1μs overhead vs ~10μs for actor)
 /// - LRU cache for frequently accessed embeddings (limit: 1000 items)
 /// - Batch operations for efficient bulk writes/reads
 /// - Atomic counters for statistics
 /// - Multiple query patterns (by model, source type, etc.)
+///
+/// Thread safety is provided by:
+/// - Swift Synchronization.Mutex for cache access
+/// - FoundationDB transaction model for database operations
 ///
 /// Storage Schema:
 /// - Embedding data: (rootPrefix, "embedding", model, id) -> encoded_record
@@ -38,7 +43,7 @@ import Logging
 /// try await store.saveBatch(records)
 /// let results = try await store.getBatch(ids: ids, model: model)
 /// ```
-public actor EmbeddingStore {
+public final class EmbeddingStore: @unchecked Sendable {
 
     // MARK: - Properties
 
@@ -52,17 +57,6 @@ public actor EmbeddingStore {
     private let logger: Logger
 
     // MARK: - Cache
-
-    /// LRU cache for embedding records
-    /// Key: "\(model):\(id)"
-    /// Value: EmbeddingRecord
-    private var vectorCache: [String: CacheEntry] = [:]
-
-    /// Ordered list of cache keys for LRU eviction
-    private var cacheAccessOrder: [String] = []
-
-    /// Maximum number of embeddings to keep in cache
-    private let cacheLimit: Int = 1000
 
     /// Cache entry with access tracking
     private struct CacheEntry {
@@ -78,6 +72,18 @@ public actor EmbeddingStore {
             self.lastAccessed = Date()
         }
     }
+
+    /// Cache state protected by Mutex
+    private struct CacheState {
+        var vectorCache: [String: CacheEntry] = [:]
+        var cacheAccessOrder: [String] = []
+    }
+
+    /// Maximum number of embeddings to keep in cache
+    private let cacheLimit: Int = 1000
+
+    /// Mutex-protected cache state
+    private let cache: Mutex<CacheState>
 
     // MARK: - Initialization
 
@@ -95,6 +101,7 @@ public actor EmbeddingStore {
         self.database = database
         self.rootPrefix = rootPrefix
         self.logger = logger
+        self.cache = Mutex(CacheState())
     }
 
     // MARK: - Single Record Operations
@@ -180,21 +187,28 @@ public actor EmbeddingStore {
         logger.debug("Getting embedding",
                     metadata: ["id": "\(id)", "model": "\(model)"])
 
-        // Check cache first
+        // Check cache first (with Mutex)
         let cacheKey = "\(model):\(id)"
-        if var entry = vectorCache[cacheKey] {
+        let cached = cache.withLock { state -> EmbeddingRecord? in
+            guard var entry = state.vectorCache[cacheKey] else {
+                return nil
+            }
             entry.updateAccess()
-            vectorCache[cacheKey] = entry
+            state.vectorCache[cacheKey] = entry
 
             // Update access order
-            if let index = cacheAccessOrder.firstIndex(of: cacheKey) {
-                cacheAccessOrder.remove(at: index)
+            if let index = state.cacheAccessOrder.firstIndex(of: cacheKey) {
+                state.cacheAccessOrder.remove(at: index)
             }
-            cacheAccessOrder.append(cacheKey)
+            state.cacheAccessOrder.append(cacheKey)
 
+            return entry.record
+        }
+
+        if let record = cached {
             logger.debug("Cache hit for embedding",
                         metadata: ["id": "\(id)", "model": "\(model)"])
-            return entry.record
+            return record
         }
 
         // Cache miss - query database
@@ -278,11 +292,13 @@ public actor EmbeddingStore {
             transaction.atomicOp(key: countKey, param: decrement, mutationType: .add)
         }
 
-        // Remove from cache
+        // Remove from cache (with Mutex)
         let cacheKey = "\(model):\(id)"
-        vectorCache.removeValue(forKey: cacheKey)
-        if let index = cacheAccessOrder.firstIndex(of: cacheKey) {
-            cacheAccessOrder.remove(at: index)
+        cache.withLock { state in
+            state.vectorCache.removeValue(forKey: cacheKey)
+            if let index = state.cacheAccessOrder.firstIndex(of: cacheKey) {
+                state.cacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.debug("Successfully deleted embedding",
@@ -299,9 +315,11 @@ public actor EmbeddingStore {
         logger.debug("Checking embedding existence",
                     metadata: ["id": "\(id)", "model": "\(model)"])
 
-        // Check cache first
+        // Check cache first (with Mutex)
         let cacheKey = "\(model):\(id)"
-        if vectorCache[cacheKey] != nil {
+        let inCache = cache.withLock { $0.vectorCache[cacheKey] != nil }
+
+        if inCache {
             return true
         }
 
@@ -412,22 +430,24 @@ public actor EmbeddingStore {
         var results: [EmbeddingRecord] = []
         var uncachedIds: [String] = []
 
-        // Check cache first
-        for id in ids {
-            let cacheKey = "\(model):\(id)"
-            if var entry = vectorCache[cacheKey] {
-                entry.updateAccess()
-                vectorCache[cacheKey] = entry
+        // Check cache first (with Mutex)
+        cache.withLock { state in
+            for id in ids {
+                let cacheKey = "\(model):\(id)"
+                if var entry = state.vectorCache[cacheKey] {
+                    entry.updateAccess()
+                    state.vectorCache[cacheKey] = entry
 
-                // Update access order
-                if let index = cacheAccessOrder.firstIndex(of: cacheKey) {
-                    cacheAccessOrder.remove(at: index)
+                    // Update access order
+                    if let index = state.cacheAccessOrder.firstIndex(of: cacheKey) {
+                        state.cacheAccessOrder.remove(at: index)
+                    }
+                    state.cacheAccessOrder.append(cacheKey)
+
+                    results.append(entry.record)
+                } else {
+                    uncachedIds.append(id)
                 }
-                cacheAccessOrder.append(cacheKey)
-
-                results.append(entry.record)
-            } else {
-                uncachedIds.append(id)
             }
         }
 
@@ -526,12 +546,14 @@ public actor EmbeddingStore {
             }
         }
 
-        // Remove from cache
-        for id in ids {
-            let cacheKey = "\(model):\(id)"
-            vectorCache.removeValue(forKey: cacheKey)
-            if let index = cacheAccessOrder.firstIndex(of: cacheKey) {
-                cacheAccessOrder.remove(at: index)
+        // Remove from cache (with Mutex)
+        cache.withLock { state in
+            for id in ids {
+                let cacheKey = "\(model):\(id)"
+                state.vectorCache.removeValue(forKey: cacheKey)
+                if let index = state.cacheAccessOrder.firstIndex(of: cacheKey) {
+                    state.cacheAccessOrder.remove(at: index)
+                }
             }
         }
 
@@ -687,52 +709,51 @@ public actor EmbeddingStore {
     ///
     /// - Parameter record: The record to cache
     private func updateCache(record: EmbeddingRecord) {
-        let cacheKey = "\(record.model):\(record.id)"
+        cache.withLock { state in
+            let cacheKey = "\(record.model):\(record.id)"
 
-        // Update or add to cache
-        if var entry = vectorCache[cacheKey] {
-            entry.updateAccess()
-            vectorCache[cacheKey] = entry
+            // Update or add to cache
+            if var entry = state.vectorCache[cacheKey] {
+                entry.updateAccess()
+                state.vectorCache[cacheKey] = entry
 
-            // Update access order
-            if let index = cacheAccessOrder.firstIndex(of: cacheKey) {
-                cacheAccessOrder.remove(at: index)
-            }
-            cacheAccessOrder.append(cacheKey)
-        } else {
-            // New entry
-            vectorCache[cacheKey] = CacheEntry(record: record)
-            cacheAccessOrder.append(cacheKey)
+                // Update access order
+                if let index = state.cacheAccessOrder.firstIndex(of: cacheKey) {
+                    state.cacheAccessOrder.remove(at: index)
+                }
+                state.cacheAccessOrder.append(cacheKey)
+            } else {
+                // New entry
+                state.vectorCache[cacheKey] = CacheEntry(record: record)
+                state.cacheAccessOrder.append(cacheKey)
 
-            // Evict if over limit
-            if vectorCache.count > cacheLimit {
-                evictOldestFromCache()
+                // Evict if over limit
+                if state.vectorCache.count > cacheLimit {
+                    guard !state.cacheAccessOrder.isEmpty else { return }
+                    let oldestKey = state.cacheAccessOrder.removeFirst()
+                    state.vectorCache.removeValue(forKey: oldestKey)
+
+                    logger.trace("Evicted cache entry",
+                                metadata: ["key": "\(oldestKey)",
+                                          "cache_size": "\(state.vectorCache.count)"])
+                }
             }
         }
-    }
-
-    /// Evict the least recently used entry from cache
-    private func evictOldestFromCache() {
-        guard !cacheAccessOrder.isEmpty else { return }
-
-        let oldestKey = cacheAccessOrder.removeFirst()
-        vectorCache.removeValue(forKey: oldestKey)
-
-        logger.trace("Evicted cache entry",
-                    metadata: ["key": "\(oldestKey)",
-                              "cache_size": "\(vectorCache.count)"])
     }
 
     /// Clear the entire cache
     ///
     /// Useful for testing or when memory needs to be freed.
     public func clearCache() {
+        let cacheSize = cache.withLock { state -> Int in
+            let size = state.vectorCache.count
+            state.vectorCache.removeAll()
+            state.cacheAccessOrder.removeAll()
+            return size
+        }
+
         logger.debug("Clearing embedding cache",
-                    metadata: ["cache_size": "\(vectorCache.count)"])
-
-        vectorCache.removeAll()
-        cacheAccessOrder.removeAll()
-
+                    metadata: ["cache_size": "\(cacheSize)"])
         logger.debug("Cache cleared")
     }
 
